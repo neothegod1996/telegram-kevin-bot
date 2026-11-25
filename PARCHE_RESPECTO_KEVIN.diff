@@ -1,0 +1,959 @@
+--- a/.env.example
++++ b/.env.example
+@@ -30,7 +30,7 @@
+ # Seconds after each batch item that actually saves to Telegram (not empty message IDs)
+ BATCH_SLEEP_TIME=3
+ # After crash/restart, resume in-progress batch tasks (ledger skips already-delivered posts)
+-BATCH_AUTO_RESUME_ON_START=true
++BATCH_AUTO_RESUME_ON_START=false
+ 
+ # --- Optional: web login portal ---
+ # true / false / yes / no / 1 / 0
+@@ -44,4 +44,6 @@
+ 
+ # --- Optional: encrypt user session strings in MongoDB ---
+ # Required if existing sessions in DB were stored encrypted (enc:...)
+-SESSION_ENCRYPTION_KEY=+SESSION_ENCRYPTION_KEY=
++# Default: never unpack archives into server temporary storage for Notion.
++NOTION_EXTRACT_ARCHIVES=false
+--- a/bot/backup/notion_backup.py
++++ b/bot/backup/notion_backup.py
+@@ -115,6 +115,12 @@
+             return report
+ 
+         if is_archive(file_path):
++            # Notion archive extraction can consume many times the compressed size.
++            # Keep it off until explicitly enabled, and enforce resource limits.
++            if os.environ.get("NOTION_EXTRACT_ARCHIVES", "false").lower() not in ("true", "1", "yes"):
++                report.status = "skipped"
++                report.error = "archive_extraction_disabled"
++                return report
+             archive_result = await asyncio.to_thread(upload_archive_to_notion, file_path)
+             if archive_result and archive_result.file_ids:
+                 notion_file_id = archive_result.file_ids[0]
+--- a/bot/backup/rollback.py
++++ b/bot/backup/rollback.py
+@@ -1,81 +1,18 @@
+-"""Undo in-flight message delivery so pause/cancel can retry the same message."""
++"""Legacy cancellation helper: deliberately non-destructive.
+ 
+-from __future__ import annotations
++Previously this module deleted destination messages and erased successful delivery
++records.  A backup must never undo confirmed successful deliveries just because
++an operator paused/cancelled during subsequent work.  Callers may still import
++this function during a gradual migration; it is a safe no-op.
++"""
+ 
+ import logging
+-
+-from pyrogram import Client
+-
+-from database import db
+ 
+ logger = logging.getLogger(__name__)
+ 
+ 
+-async def rollback_message_delivery(
+-    bot: Client,
+-    app: Client,
+-    source_chat_id: int,
+-    source_message_id: int,
+-) -> None:
+-    """Delete destination copies, clear ledger + local Notion metadata for one source message."""
+-    ledger_docs = await db.delivery_ledger.filter_by_source(
+-        int(source_chat_id), int(source_message_id)
++async def rollback_message_delivery(bot, app, source_chat_id: int, source_message_id: int) -> None:
++    logger.info(
++        "Stop requested for %s:%s: confirmed copies and ledger intentionally retained",
++        source_chat_id, source_message_id,
+     )
+-    for doc in ledger_docs:
+-        dest_chat_id = doc.get("dest_chat_id")
+-        dest_message_id = doc.get("dest_message_id")
+-        if dest_chat_id and dest_message_id:
+-            deleted = False
+-            for client in (app, bot):
+-                if client is None:
+-                    continue
+-                try:
+-                    await client.delete_messages(int(dest_chat_id), int(dest_message_id))
+-                    deleted = True
+-                    logger.info(
+-                        "Rolled back dest %s:%s for source %s:%s",
+-                        dest_chat_id,
+-                        dest_message_id,
+-                        source_chat_id,
+-                        source_message_id,
+-                    )
+-                    break
+-                except Exception as exc:
+-                    logger.debug("delete_messages failed via %s: %s", type(client).__name__, exc)
+-            if not deleted:
+-                logger.warning(
+-                    "Could not delete destination %s:%s (source %s:%s)",
+-                    dest_chat_id,
+-                    dest_message_id,
+-                    source_chat_id,
+-                    source_message_id,
+-                )
+-        await db.delivery_ledger.delete(doc["_id"])
+-
+-    msg_doc = await db.messages.message_exists(int(source_message_id), int(source_chat_id))
+-    if msg_doc:
+-        page_id = msg_doc.get("notion_page_id")
+-        if page_id:
+-            _archive_notion_page(page_id)
+-        await db.messages.delete_by_message_id(int(source_chat_id), int(source_message_id))
+-
+-
+-def _archive_notion_page(page_id: str) -> None:
+-    try:
+-        from bot.utils.notion_pages import NotionPageCreator
+-
+-        creator = NotionPageCreator()
+-        import requests
+-
+-        response = requests.patch(
+-            f"{creator.base_url}/pages/{page_id}",
+-            headers=creator.headers,
+-            json={"archived": True},
+-            timeout=30,
+-        )
+-        if response.ok:
+-            logger.info("Archived Notion page %s after rollback", page_id)
+-        else:
+-            logger.warning("Notion archive failed for %s: %s", page_id, response.text[:200])
+-    except Exception as exc:
+-        logger.warning("Could not archive Notion page %s: %s", page_id, exc)--- a/bot/config.py
++++ b/bot/config.py
+@@ -41,7 +41,7 @@
+     # Pause after each batch item that actually hits Telegram (not empty ID gaps / ledger skips).
+     BATCH_SLEEP_TIME = int(os.environ.get("BATCH_SLEEP_TIME", 3))
+     BATCH_AUTO_RESUME_ON_START = is_enabled(
+-        os.environ.get("BATCH_AUTO_RESUME_ON_START", "true"), True
++        os.environ.get("BATCH_AUTO_RESUME_ON_START", "false"), False
+     )
+ 
+     # Operator
+--- a/bot/plugins/callback/batch_callback.py
++++ b/bot/plugins/callback/batch_callback.py
+@@ -184,7 +184,7 @@
+         task_id, ControlCommand.PAUSE.value, worker_phase=WorkerPhase.DRAINING.value
+     )
+     await query.answer(
+-        "⏸️ Pausing — stopping now, rolling back the current message.",
++        "⏸️ Pausing — confirmed copies are preserved; current message may be retried.",
+         show_alert=True,
+     )
+     await update_task_ui(query, task_id)
+--- a/bot/plugins/on_message.py
++++ b/bot/plugins/on_message.py
+@@ -233,7 +233,7 @@
+                 else:
+                     notion_fail += 1
+         except CancelledError:
+-            logging.info(f"Transfer cancelled for message {message.link}")
++            logging.info(f"Transfer cancelled for message {message.link}; confirmed deliveries remain saved")
+             await rollback_message_delivery(bot, app, message.chat.id, message.id)
+             Config.TRANSFERS.pop(download_id, None)
+             await update_transfer(
+@@ -254,7 +254,7 @@
+             await bot.floodwait_handler(
+                 bot.send_message,
+                 user_id,
+-                f"⏹️ Stopped on link {i}/{len(links)}. Progress rolled back — resume to retry this message.",
++                f"⏹️ Stopped on link {i}/{len(links)}. Confirmed copies preserved — resume to finish this message.",
+                 reply_markup=markup,
+             )
+             break
+--- a/bot/utils/archive_handler.py
++++ b/bot/utils/archive_handler.py
+@@ -1,30 +1,34 @@
+-#!/usr/bin/env python3
+-# -*- coding: utf-8 -*-
++"""Resource-bounded archive extraction for optional Notion backups.
++
++ZIP and RAR are never automatically extracted by default (see
++NOTION_EXTRACT_ARCHIVES).  Explicit opt-in is still bounded to prevent archive
++traversal, excessive file counts, and oversized extracted contents.
+ """
+-File: archive_handler.py
+-Author: Maria Kevin
+-Description: Handle extraction and processing of archive files (.zip, .rar)
+-"""
++
++from __future__ import annotations
+ 
+ import logging
+ import os
+ import shutil
++import stat
+ import tempfile
++import zipfile
++from pathlib import Path, PurePosixPath
++from typing import Optional
++
++import rarfile
+ 
+ logger = logging.getLogger(__name__)
+-import zipfile
+-from pathlib import Path
+-from typing import List, Optional
+-import rarfile
++
++DEFAULT_MAX_FILES = 100
++DEFAULT_MAX_TOTAL_SIZE = 500 * 1024 * 1024
+ 
+ 
+ class ArchiveHandlerError(Exception):
+-    """Custom exception for archive handling errors"""
+     pass
+ 
+ 
+ class ExtractedFile:
+-    """Represents an extracted file from an archive"""
+     def __init__(self, path: str, relative_path: str, size: int):
+         self.path = path
+         self.relative_path = relative_path
+@@ -33,148 +37,109 @@
+ 
+ 
+ def is_archive(file_path: str) -> bool:
+-    """
+-    Check if a file is a supported archive format.
+-    
+-    Args:
+-        file_path: Path to the file
+-    
+-    Returns:
+-        True if file is .zip or .rar, False otherwise
+-    """
+-    ext = Path(file_path).suffix.lower()
+-    return ext in ['.zip', '.rar']
++    return Path(file_path).suffix.lower() in (".zip", ".rar")
++
++
++def _relative_path(raw: str) -> Path:
++    # Telegram archives come from untrusted users.  Normalize both slash types.
++    fixed = raw.replace("\\", "/")
++    posix = PurePosixPath(fixed)
++    if (
++        posix.is_absolute()
++        or not fixed
++        or any(x in ("", ".", "..") for x in fixed.split("/"))
++        or ":" in fixed
++        or "\x00" in fixed
++    ):
++        raise ArchiveHandlerError(f"Unsafe archive member: {raw!r}")
++    return Path(*posix.parts)
++
++
++def _extract_stream(stream, target: Path, remaining: int) -> int:
++    # Do not trust ZIP/RAR headers alone; also check actual decompressed bytes.
++    written = 0
++    with open(target, "xb") as out:
++        while True:
++            chunk = stream.read(min(1024 * 1024, remaining - written + 1))
++            if not chunk:
++                break
++            written += len(chunk)
++            if written > remaining:
++                raise ArchiveHandlerError("Archive extraction exceeded size limit")
++            out.write(chunk)
++    return written
+ 
+ 
+ def extract_archive(
+     archive_path: str,
+     extract_to: Optional[str] = None,
+-) -> List[ExtractedFile]:
+-    """
+-    Extract archive file (.zip or .rar) to a directory.
+-    
+-    Args:
+-        archive_path: Path to the archive file
+-        extract_to: Directory to extract to (defaults to temp directory)
+-    
+-    Returns:
+-        List of ExtractedFile objects
+-    
+-    Raises:
+-        ArchiveHandlerError: If extraction fails or limits are exceeded
+-        FileNotFoundError: If archive doesn't exist
+-    """
+-    if not os.path.exists(archive_path):
+-        raise FileNotFoundError(f"Archive not found: {archive_path}")
+-    
+-    ext = Path(archive_path).suffix.lower()
+-    
+-    # Create extraction directory
+-    if extract_to is None:
+-        extract_to = tempfile.mkdtemp(prefix="archive_extract_")
+-    else:
+-        os.makedirs(extract_to, exist_ok=True)
+-    
+-    extracted_files = []
++    *,
++    max_files: int = DEFAULT_MAX_FILES,
++    max_total_size: int = DEFAULT_MAX_TOTAL_SIZE,
++) -> list[ExtractedFile]:
++    if not os.path.isfile(archive_path):
++        raise FileNotFoundError(archive_path)
++    if max_files < 1 or max_total_size < 1:
++        raise ValueError("Archive limits must be positive")
++    owns_dir = extract_to is None
++    destination = Path(extract_to or tempfile.mkdtemp(prefix="archive_extract_"))
++    destination.mkdir(parents=True, exist_ok=True)
++    result: list[ExtractedFile] = []
++
++    def validated(infos, isdir, size, filename):
++        files = [x for x in infos if not isdir(x)]
++        if len(files) > max_files:
++            raise ArchiveHandlerError(f"Too many files: {len(files)} > {max_files}")
++        total = sum(int(size(x)) for x in files)
++        if total > max_total_size:
++            raise ArchiveHandlerError(f"Uncompressed archive exceeds {max_total_size} bytes")
++        for info in files:
++            rel = _relative_path(filename(info))
++            yield info, rel
+ 
+     try:
+-        if ext == '.zip':
+-            extracted_files = _extract_zip(
+-                archive_path, extract_to
+-            )
+-        elif ext == '.rar':
+-            extracted_files = _extract_rar(
+-                archive_path, extract_to
+-            )
++        ext = Path(archive_path).suffix.lower()
++        if ext == ".zip":
++            with zipfile.ZipFile(archive_path) as archive:
++                infos = list(validated(archive.infolist(), lambda f: f.is_dir(),
++                                       lambda f: f.file_size, lambda f: f.filename))
++                remaining = max_total_size
++                for info, rel in infos:
++                    mode = (info.external_attr >> 16) & 0xFFFF
++                    if stat.S_ISLNK(mode):
++                        raise ArchiveHandlerError("ZIP symlink not allowed")
++                    target = destination / rel
++                    target.parent.mkdir(parents=True, exist_ok=True)
++                    with archive.open(info) as stream:
++                        actual = _extract_stream(stream, target, remaining)
++                    remaining -= actual
++                    result.append(ExtractedFile(str(target), str(rel), actual))
++        elif ext == ".rar":
++            with rarfile.RarFile(archive_path) as archive:
++                infos = list(validated(archive.infolist(), lambda f: f.isdir(),
++                                       lambda f: f.file_size, lambda f: f.filename))
++                remaining = max_total_size
++                for info, rel in infos:
++                    link_attr = getattr(info, "is_symlink", False)
++                    if bool(link_attr() if callable(link_attr) else link_attr):
++                        raise ArchiveHandlerError("RAR symlink not allowed")
++                    target = destination / rel
++                    target.parent.mkdir(parents=True, exist_ok=True)
++                    with archive.open(info) as stream:
++                        actual = _extract_stream(stream, target, remaining)
++                    remaining -= actual
++                    result.append(ExtractedFile(str(target), str(rel), actual))
+         else:
+-            raise ArchiveHandlerError(f"Unsupported archive format: {ext}")
+-        
+-        return extracted_files
+-    
+-    except Exception as e:
+-        # Clean up on error
+-        if extract_to and os.path.exists(extract_to):
+-            shutil.rmtree(extract_to, ignore_errors=True)
+-        raise ArchiveHandlerError(f"Failed to extract archive: {str(e)}") from e
+-
+-
+-def _extract_zip(
+-    zip_path: str,
+-    extract_to: str,
+-) -> List[ExtractedFile]:
+-    """Extract ZIP archive"""
+-    extracted_files = []
+-    total_size = 0
+-    
+-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+-        # Get list of files (excluding directories)
+-
+-        
+-        # Check total size before extraction
+-        for file_info in zip_ref.infolist():
+-            if not file_info.is_dir():
+-                total_size += file_info.file_size
+-        
+-
+-        
+-        # Extract all files
+-        zip_ref.extractall(extract_to)
+-        
+-        # Build list of extracted files
+-        for file_info in zip_ref.infolist():
+-            if not file_info.is_dir():
+-                full_path = os.path.join(extract_to, file_info.filename)
+-                if os.path.exists(full_path):
+-                    extracted_files.append(ExtractedFile(
+-                        path=full_path,
+-                        relative_path=file_info.filename,
+-                        size=file_info.file_size
+-                    ))
+-    
+-    return extracted_files
+-
+-
+-def _extract_rar(
+-    rar_path: str,
+-    extract_to: str,
+-) -> List[ExtractedFile]:
+-    """Extract RAR archive"""
+-    extracted_files = []
+-    total_size = 0
+-    
+-    with rarfile.RarFile(rar_path, 'r') as rar_ref:
+-        # Check total size before extraction
+-        for file_info in rar_ref.infolist():
+-            if not file_info.isdir():
+-                total_size += file_info.file_size
+-        
+-
+-        # Extract all files
+-        rar_ref.extractall(extract_to)
+-        
+-        # Build list of extracted files
+-        for file_info in rar_ref.infolist():
+-            if not file_info.isdir():
+-                full_path = os.path.join(extract_to, file_info.filename)
+-                if os.path.exists(full_path):
+-                    extracted_files.append(ExtractedFile(
+-                        path=full_path,
+-                        relative_path=file_info.filename,
+-                        size=file_info.file_size
+-                    ))
+-    
+-    return extracted_files
++            raise ArchiveHandlerError(f"Unsupported archive: {ext}")
++        return result
++    except Exception as exc:
++        if owns_dir:
++            shutil.rmtree(destination, ignore_errors=True)
++        if isinstance(exc, ArchiveHandlerError):
++            raise
++        raise ArchiveHandlerError(f"Archive extraction failed: {exc}") from exc
+ 
+ 
+ def cleanup_extracted_files(extract_dir: str):
+-    """
+-    Clean up extracted files directory.
+-    
+-    Args:
+-        extract_dir: Directory containing extracted files
+-    """
+-    if extract_dir and os.path.exists(extract_dir):
+-        try:
+-            shutil.rmtree(extract_dir)
+-        except Exception as e:
+-            logger.warning(f"Failed to cleanup {extract_dir}: {e}")
++    if extract_dir and os.path.isdir(extract_dir):
++        shutil.rmtree(extract_dir, ignore_errors=True)
+--- a/bot/utils/batch/resume.py
++++ b/bot/utils/batch/resume.py
+@@ -1,4 +1,9 @@
+-"""Resume batch work after bot restart without re-copying ledger-confirmed messages."""
++"""Recover interrupted tasks safely after a server restart.
++
++A running task from a previous process is no longer running. Always mark it
++paused so the operator may resume it, regardless of auto-resume configuration.
++By default, do NOT start network transfers automatically on boot.
++"""
+ 
+ import logging
+ 
+@@ -12,37 +17,38 @@
+ 
+ 
+ async def resume_interrupted_batches(bot: Client) -> int:
+-    """
+-    Tasks left as 'running' when the process died are marked paused then resumed.
+-    Delivery ledger skips messages already confirmed to each destination.
+-    """
+-    if not Config.BATCH_AUTO_RESUME_ON_START:
+-        return 0
+-
+-    from bot.utils.batch.worker import start_background_batch
+-
+     interrupted = await db.batch_tasks.filter_documents({"status": "running"})
+     if not interrupted:
+         return 0
++
++    if Config.BATCH_AUTO_RESUME_ON_START:
++        from bot.utils.batch.worker import start_background_batch
+ 
+     resumed = 0
+     for task in interrupted:
+         task_id = task["_id"]
+         user_id = task["user_id"]
++        # A stale 'running' value would make the UI refuse a manual Resume.
+         await db.batch_tasks.update_status(task_id, "paused")
+-        await db.batch_tasks.clear_control(task_id, worker_phase=WorkerPhase.PAUSED.value)
+-        await db.batch_tasks.update_status(task_id, "running")
+-        await db.batch_tasks.clear_control(task_id, worker_phase=WorkerPhase.PROCESSING.value)
+-        await start_background_batch(bot, user_id, task_id)
+-        resumed += 1
++        await db.batch_tasks.clear_control(
++            task_id, worker_phase=WorkerPhase.PAUSED.value
++        )
++        if Config.BATCH_AUTO_RESUME_ON_START:
++            await db.batch_tasks.update_status(task_id, "running")
++            await db.batch_tasks.clear_control(
++                task_id, worker_phase=WorkerPhase.PROCESSING.value
++            )
++            await start_background_batch(bot, user_id, task_id)
++            resumed += 1
+         try:
++            action = "automatically resumed" if Config.BATCH_AUTO_RESUME_ON_START else "paused for manual Resume"
+             await bot.send_message(
+                 user_id,
+-                f"🔄 **Bot restarted** — batch task `#{task_id}` resumed at message "
+-                f"`{task.get('current_message_id', '?')}`. Already-delivered posts are skipped.",
++                f"🔄 Bot restarted — batch task #{task_id} {action} at message "
++                f"{task.get('current_message_id', '?')}. Confirmed copies remain recorded.",
+             )
+         except Exception as exc:
+-            logger.debug("Could not notify user %s about batch resume: %s", user_id, exc)
++            logger.debug("Could not notify user %s about batch recovery: %s", user_id, exc)
+ 
+-    logger.info("Auto-resumed %s interrupted batch task(s)", resumed)
+-    return resumed+    logger.info("Recovered %s stale task(s); auto-resumed %s", len(interrupted), resumed)
++    return resumed
+--- a/bot/utils/batch/setup.py
++++ b/bot/utils/batch/setup.py
+@@ -88,7 +88,15 @@
+     if not app:
+         return await bot.send_message(user_id, "⚠️ Please log in first.")
+ 
+-    max_indexed = await db.batch_tasks.get_max_message_id(chat_id)
++    incomplete = await db.batch_tasks.unfinished_general_tasks(chat_id, user_id)
++    if incomplete:
++        return await bot.send_message(
++            user_id,
++            "⚠️ This chat has unfinished/failed batch work. Resume or audit it "
++            "before Sync; skipping ahead could miss messages.",
++        )
++
++    max_indexed = await db.batch_tasks.get_max_message_id(chat_id, user_id)
+     if max_indexed is None:
+         return await bot.send_message(
+             user_id,
+--- a/bot/utils/batch/ui.py
++++ b/bot/utils/batch/ui.py
+@@ -87,7 +87,7 @@
+ 
+ def format_task_text(task: dict) -> str:
+     scanned_count = (
+-        (task["current_message_id"] - task["first_message_id"] + 1)
++        (task["current_message_id"] - task["first_message_id"])
+         if task["status"] != "completed"
+         else task["total_messages"]
+     )
+@@ -117,6 +117,7 @@
+         topic_tag += " (priority)"
+ 
+     control_line = control_status_line(task.get("control"), task.get("worker_phase"))
++    retry_line = f"⚠️ **Retry pending at message** `{task['retry_message_id']}`\n" if task.get("retry_message_id") is not None else ""
+     worker_line = ""
+     if task.get("worker_message_id") and task.get("worker_phase") == WorkerPhase.PROCESSING.value:
+         worker_line = f"**Current message id**: `{task['worker_message_id']}`\n"
+@@ -131,6 +132,7 @@
+     text += (
+         f"**Chat**: {chat_title}\n"
+         f"{worker_line}"
++        f"{retry_line}"
+         f"**Progress**: `{scanned_count}`/`{task['total_messages']}` (`{pct:.1f}%` - `{left_count}` left)\n"
+         f"**Saved**: `{task['processed_count']}` messages\n"
+         f"**Telegram**: ✅ `{len(task.get('telegram_succeeded', []))}` | "
+--- a/bot/utils/batch/worker.py
++++ b/bot/utils/batch/worker.py
+@@ -19,6 +19,14 @@
+ logger = logging.getLogger(__name__)
+ 
+ RUNNING_TASKS: set[int] = set()
++
++
++async def safe_status_message(bot: Client, user_id: int, text: str) -> None:
++    """Failure to notify the operator must never change a successful batch into failed."""
++    try:
++        await bot.send_message(user_id, text)
++    except Exception as exc:
++        logger.warning("Could not notify user %s about batch status: %s", user_id, exc)
+ 
+ 
+ async def start_background_batch(bot: Client, user_id: int, task_id: int):
+@@ -62,15 +70,15 @@
+     *,
+     source_topic_id: int | None = None,
+     task_id: int | None = None,
+-) -> tuple[bool, bool]:
++) -> tuple[bool | None, bool]:
+     from bot.utils.notion_settings import notion_enabled_for_user
+ 
+     notion_enabled = notion_enabled_for_user(user_id, notion_enabled)
+     try:
+         message = await app.get_messages(chat_id, message_id)
+     except Exception as e:
+-        logger.debug(f"Could not get message {message_id}: {e}")
+-        return False, False
++        logger.warning("Cannot read %s:%s; leave checkpoint unchanged: %s", chat_id, message_id, e)
++        return None, False
+ 
+     if not message or message.empty or message.sticker or message.service:
+         return False, False
+@@ -151,6 +159,15 @@
+                     "failed_destinations": tg.failed_destinations,
+                 },
+             )
++        # Avoid expensive optional uploads when Telegram has missing destinations.
++        if tg.status not in ("succeeded", "skipped"):
++            if fwd.retained_path and os.path.exists(fwd.retained_path):
++                try:
++                    os.remove(fwd.retained_path)
++                except OSError:
++                    pass
++            logger.warning("Unconfirmed Telegram destination(s) for %s:%s", chat_id, message_id)
++            return None, False
+         if notion_enabled:
+             if await should_abort():
+                 await rollback_message_delivery(bot, app, chat_id, message_id)
+@@ -198,13 +215,18 @@
+                         "error": notion_report.error,
+                     },
+                 )
++        # A partial or failed Telegram delivery is NOT an acknowledged message.
++        # Keep the checkpoint on this message so the ledger can retry only missing routes.
++        if notion_enabled and notion_report.status == "failed":
++            logger.warning("Notion failed for %s:%s; do not advance", chat_id, message_id)
++            return None, False
+         return True, True
+     except CancelledError:
+-        logger.info("Batch item %s:%s aborted (pause/cancel); rolled back", chat_id, message_id)
++        logger.info("Batch item %s:%s interrupted; confirmed copies are retained", chat_id, message_id)
+         raise
+     except Exception:
+-        logger.exception("Batch save failed for %s:%s", chat_id, message_id)
+-        return False, False
++        logger.exception("Batch save failed for %s:%s; checkpoint unchanged", chat_id, message_id)
++        return None, False
+     finally:
+         Config.TRANSFERS.pop(download_id, None)
+ 
+@@ -241,11 +263,10 @@
+                 )
+             break
+ 
+-        await db.batch_tasks.set_control(
+-            task_id,
+-            task.get("control"),
+-            worker_phase=WorkerPhase.PROCESSING.value,
+-            worker_message_id=msg_id,
++        # Do NOT write stale task["control"] here: that could erase a pause/cancel
++        # set concurrently by a callback immediately before this worker step.
++        await db.batch_tasks.set_worker_state(
++            task_id, worker_phase=WorkerPhase.PROCESSING.value, worker_message_id=msg_id
+         )
+         try:
+             counted, throttle = await process_message_item(
+@@ -261,9 +282,23 @@
+         except CancelledError:
+             await db.batch_tasks.update_progress(task_id, msg_id, count)
+             break
++        if counted is None:
++            # An API failure, partial delivery or Notion failure is recoverable.
++            # Do not skip it, even if other destinations were already confirmed.
++            await db.batch_tasks.update_status(task_id, "paused", count)
++            await db.batch_tasks.set_worker_state(task_id, worker_phase=WorkerPhase.PAUSED.value)
++            await db.batch_tasks.update(
++                task_id,
++                {"retry_message_id": msg_id, "last_error": "Delivery/read failed; resume to retry"},
++            )
++            logger.warning("Paused task %s at retryable message %s", task_id, msg_id)
++            break
+         if counted:
++            await db.batch_tasks.resolve_message_failures(task_id, chat_id, msg_id)
+             count += 1
+         await db.batch_tasks.update_progress(task_id, msg_id + 1, count)
++        if task.get("retry_message_id") == msg_id:
++            await db.batch_tasks.update(task_id, {"retry_message_id": None, "last_error": None})
+ 
+         halt, reason = await batch_should_halt(task_id)
+         if halt:
+@@ -283,36 +318,44 @@
+     if control in (ControlCommand.CANCEL.value, ControlCommand.STOP.value):
+         await db.batch_tasks.update_status(task_id, "stopped", processed_count)
+         await db.batch_tasks.clear_control(task_id, worker_phase=WorkerPhase.STOPPED.value)
+-        await bot.send_message(
+-            user_id, f"⏹️ Batch task #{task_id} stopped. Saved {processed_count} messages."
++        await safe_status_message(
++            bot, user_id, f"⏹️ Batch task #{task_id} stopped. Saved {processed_count} messages."
+         )
+         return
+-    if control == ControlCommand.PAUSE.value or task["current_message_id"] < task["last_message_id"]:
++    if control == ControlCommand.PAUSE.value or task["current_message_id"] <= task["last_message_id"]:
+         await db.batch_tasks.update_status(task_id, "paused", processed_count)
+         await db.batch_tasks.clear_control(task_id, worker_phase=WorkerPhase.PAUSED.value)
+-        await bot.send_message(
+-            user_id,
++        await safe_status_message(
++            bot, user_id,
+             f"⏸️ Batch task #{task_id} paused at message {task['current_message_id']}. "
+             "Worker is idle; use Resume to continue.",
+         )
+         return
+-    if task["current_message_id"] >= task["last_message_id"]:
++    if task["current_message_id"] > task["last_message_id"]:
+         await db.batch_tasks.update_status(task_id, "completed", processed_count)
+         await db.batch_tasks.clear_control(task_id, worker_phase=WorkerPhase.IDLE.value)
+-        await bot.send_message(
+-            user_id, f"✅ Batch task #{task_id} completed. Processed {processed_count} messages."
++        await safe_status_message(
++            bot, user_id, f"✅ Batch task #{task_id} completed. Processed {processed_count} messages."
+         )
+ 
+ 
+ async def process_batch_task(bot: Client, user_id: int, task_id: int):
+-    app, task = await load_task_context(task_id, user_id)
+-    if not app or not task:
+-        return
+     try:
++        app, task = await load_task_context(task_id, user_id)
++        if not app or not task:
++            return
+         processed_count = await run_batch_loop(bot, app, task, task_id, user_id)
++        current_task = await db.batch_tasks.read(task_id)
++        if current_task and current_task.get("status") == "paused" and current_task.get("retry_message_id") is not None:
++            await safe_status_message(
++                bot, user_id,
++                f"⚠️ Batch #{task_id} paused on message "
++                f"{current_task['retry_message_id']} after a recoverable failure. "
++                "Confirmed copies were kept. Fix the cause and Resume to retry this message.",
++            )
+         await complete_or_pause_task(bot, task_id, user_id, processed_count)
+-    except Exception as e:
+-        logger.error(f"Error in task {task_id}: {e}")
++    except Exception:
++        logger.exception("Unexpected error in batch task %s", task_id)
+         await db.batch_tasks.update_status(task_id, "failed")
+     finally:
+         RUNNING_TASKS.discard(task_id)
+--- a/bot/utils/notion.py
++++ b/bot/utils/notion.py
+@@ -9,6 +9,7 @@
+ import logging
+ import mimetypes
+ import os
++import tempfile
+ from typing import TYPE_CHECKING, List, Optional
+ 
+ logger = logging.getLogger(__name__)
+@@ -89,7 +90,8 @@
+             json={
+                 "filename": os.path.basename(file_path),
+                 "content_type": mime_type
+-            }
++            },
++            timeout=30,
+         )
+         create_response.raise_for_status()
+         
+@@ -101,7 +103,8 @@
+             upload_response = requests.post(
+                 upload_info.upload_url,
+                 headers=auth_headers,
+-                files={"file": (os.path.basename(file_path), f, mime_type)}
++                files={"file": (os.path.basename(file_path), f, mime_type)},
++                timeout=(30, 300),
+             )
+             upload_response.raise_for_status()
+         
+@@ -161,71 +164,35 @@
+     archive_path: str,
+     notion_token: Optional[str] = None,
+     max_files: int = 100,
+-    max_total_size: int = 500 * 1024 * 1024  # 500 MB
++    max_total_size: int = 500 * 1024 * 1024,
+ ) -> ArchiveUploadResult:
++    """Optional bounded extraction with all-or-nothing success reporting.
++
++    Note: a failure partway through uploading can leave orphaned uploads in Notion.
++    Do not record the archive as successful unless *all* members are uploaded.
+     """
+-    Extract archive (.zip or .rar) and upload each file individually to Notion.
+-    
+-    Args:
+-        archive_path: Path to the archive file
+-        notion_token: Notion integration token (defaults to NOTION_TOKEN env var)
+-        max_files: Maximum number of files to extract
+-        max_total_size: Maximum total size of extracted files in bytes
+-    
+-    Returns:
+-        ArchiveUploadResult with list of file IDs and metadata
+-    
+-    Raises:
+-        NotionUploadError: If upload fails
+-        ArchiveHandlerError: If extraction fails
+-        FileNotFoundError: If archive doesn't exist
+-    """
+-    extract_dir = None
+-    
+-    try:
+-        # Extract archive
+-        logger.info(f"Extracting archive: {os.path.basename(archive_path)}")
++    with tempfile.TemporaryDirectory(prefix="notion_extract_") as extract_dir:
+         extracted_files = extract_archive(
+-            archive_path
++            archive_path,
++            extract_to=extract_dir,
++            max_files=max_files,
++            max_total_size=max_total_size,
+         )
+-        
+         if not extracted_files:
+-            raise NotionUploadError("Archive is empty or contains no files")
+-        
+-        # Get extraction directory from first file
+-        extract_dir = os.path.dirname(extracted_files[0].path)
+-        
+-        logger.info(f"Uploading {len(extracted_files)} files to Notion...")
+-        
+-        # Upload each file
+-        file_ids = []
+-        file_names = []
+-        
+-        for idx, extracted_file in enumerate(extracted_files, 1):
++            raise NotionUploadError("Archive is empty")
++        file_ids, file_names = [], []
++        for extracted_file in extracted_files:
+             try:
+-                logger.info(f"  [{idx}/{len(extracted_files)}] Uploading: {extracted_file.relative_path}")
+                 result = upload_file_to_notion(extracted_file.path, notion_token)
+-                file_ids.append(result.file_id)
+-                file_names.append(extracted_file.relative_path)
+-            except Exception as e:
+-                logger.warning(f"  Failed to upload {extracted_file.relative_path}: {e}")
+-                # Continue with other files
+-                continue
+-        
+-        if not file_ids:
+-            raise NotionUploadError("Failed to upload any files from archive")
+-        
+-        logger.info(f"Successfully uploaded {len(file_ids)}/{len(extracted_files)} files")
+-        
++            except Exception as exc:
++                raise NotionUploadError(
++                    f"Partial archive upload after {len(file_ids)}/{len(extracted_files)} members: {exc}"
++                ) from exc
++            file_ids.append(result.file_id)
++            file_names.append(extracted_file.relative_path)
+         return ArchiveUploadResult(
+             file_ids=file_ids,
+             file_names=file_names,
+             archive_name=os.path.basename(archive_path),
+-            total_files=len(file_ids)
++            total_files=len(extracted_files),
+         )
+-    
+-    finally:
+-        # Clean up extracted files
+-        if extract_dir:
+-            cleanup_extracted_files(extract_dir)
+-
+--- a/database/batch_tasks.py
++++ b/database/batch_tasks.py
+@@ -65,6 +65,15 @@
+             update_data["worker_message_id"] = worker_message_id
+         return await super().update(task_id, update_data)
+ 
++    async def set_worker_state(
++        self, task_id: int, *, worker_phase: str, worker_message_id: int | None = None
++    ):
++        """Set progress display fields without overwriting a concurrent pause/cancel."""
++        payload = {"worker_phase": worker_phase, "updated_at": datetime.now()}
++        if worker_message_id is not None:
++            payload["worker_message_id"] = worker_message_id
++        return await super().update(task_id, payload)
++
+     async def clear_control(self, task_id: int, worker_phase: str | None = None):
+         payload = {
+             "control": None,
+@@ -121,6 +130,29 @@
+         cursor = self.col.aggregate(pipeline)
+         return await cursor.to_list(length=None)
+ 
++    async def resolve_message_failures(
++        self, task_id: int, source_chat_id: int, source_message_id: int
++    ):
++        """Remove stale failure reports when the same message later succeeds.
++
++        Keep failures for every other message; otherwise Sync could incorrectly
++        consider an incompletely copied batch a clean baseline.
++        """
++        task = await self.read(task_id)
++        if not task:
++            return
++        for key in ("telegram_failed", "notion_failed"):
++            old = list(task.get(key, []))
++            remaining = [
++                item for item in old
++                if not (
++                    int(item.get("source_chat_id", 0)) == int(source_chat_id)
++                    and int(item.get("source_message_id", 0)) == int(source_message_id)
++                )
++            ]
++            if remaining != old:
++                await self.update(task_id, {key: remaining})
++
+     async def append_notion_result(self, task_id: int, bucket: str, entry: dict):
+         key = f"notion_{bucket}"
+         task = await self.read(task_id)
+@@ -139,8 +171,36 @@
+         items.append(entry)
+         await self.update(task_id, {key: items})
+ 
+-    async def get_max_message_id(self, chat_id: int) -> Optional[int]:
+-        """Get the maximum last_message_id stored for a chat from batch tasks"""
+-        cursor = self.col.find({"source_chat_id": int(chat_id)}).sort("last_message_id", -1).limit(1)
++    async def unfinished_general_tasks(self, chat_id: int, user_id: int) -> list[dict]:
++        """Incomplete or failed general-chat tasks block automatic syncing.
++
++        Topic-only priority jobs are excluded: they never establish a full-chat baseline.
++        """
++        tasks = await self.filter_documents({
++            "source_chat_id": int(chat_id),
++            "user_id": int(user_id),
++            "source_topic_id": None,
++        })
++        return [t for t in tasks if (
++            t.get("status") != "completed"
++            or bool(t.get("telegram_failed"))
++            or (t.get("notion_enabled") and bool(t.get("notion_failed")))
++        )]
++
++    async def get_max_message_id(self, chat_id: int, user_id: int | None = None) -> Optional[int]:
++        """Highest *completed full-chat* range, never a started/priority topic range.
++
++        Historical versions may have incorrectly marked a task completed.  Audit
++        any legacy history before relying on it as a complete source archive.
++        """
++        query = {
++            "source_chat_id": int(chat_id),
++            "source_topic_id": None,
++            "status": "completed",
++            "telegram_failed": [],
++        }
++        if user_id is not None:
++            query["user_id"] = int(user_id)
++        cursor = self.col.find(query).sort("last_message_id", -1).limit(1)
+         documents = await cursor.to_list(length=1)
+         return documents[0]["last_message_id"] if documents else None

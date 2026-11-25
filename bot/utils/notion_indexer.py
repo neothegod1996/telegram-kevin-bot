@@ -1,0 +1,172 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+File: notion_indexer.py
+Author: Maria Kevin
+Description: Index Telegram messages to Notion pages
+"""
+
+from bot.utils.formatters import (
+    create_message_title,
+    create_telegram_style_footer,
+    create_telegram_style_header,
+)
+import logging
+from bot.utils.notion_pages import NotionConfigurationError, NotionPageCreator
+from bot.utils.notion_settings import (
+    ensure_notion_parent_page_id,
+    normalize_notion_page_id,
+    user_may_use_notion,
+)
+from database import db
+
+logger = logging.getLogger(__name__)
+
+
+async def index_messages_to_notion(*, user_id: int):
+    """Index all unindexed messages to Notion (owner only)."""
+    if not user_may_use_notion(user_id):
+        logger.debug("Skipping Notion indexing: caller is not the bot owner")
+        return
+    parent_page_id = await ensure_notion_parent_page_id()
+    if not parent_page_id:
+        logger.debug(
+            "Skipping Notion indexing: configure a parent page via /nchange or NOTION_PARENT_PAGE_ID."
+        )
+        return
+
+    try:
+        notion = NotionPageCreator(default_parent_id=parent_page_id)
+    except NotionConfigurationError as exc:
+        logger.warning("Notion indexer not started: %s", exc)
+        return
+
+    messages = await db.messages.get_unindexed()
+    if not messages:
+        return
+
+    indexed = 0
+    for msg in messages:
+        try:
+            # Get or create channel page
+            channel_page_id = normalize_notion_page_id(
+                await db.notion_mapping.get_or_create(
+                    chat_id=msg["chat_id"],
+                    chat_name=msg["channel_name"] or f"Chat {msg['chat_id']}",
+                )
+            )
+
+            if not channel_page_id:
+                # Create channel page
+                channel_page_id = notion.create_page(
+                    title=msg["channel_name"] or f"Chat {msg['chat_id']}"
+                )
+                await db.notion_mapping.save_mapping(
+                    chat_id=msg["chat_id"],
+                    chat_name=msg["channel_name"] or f"Chat {msg['chat_id']}",
+                    notion_page_id=channel_page_id
+                )
+            
+            # Get or create topic page if exists
+            parent_page_id = channel_page_id
+            if msg.get("topic_id"):
+                topic_page_id = normalize_notion_page_id(
+                    await db.notion_mapping.get_or_create(
+                        chat_id=msg["chat_id"],
+                        chat_name=msg["channel_name"],
+                        topic_id=msg["topic_id"],
+                        topic_name=msg["topic_name"],
+                    )
+                )
+
+                if not topic_page_id:
+                    topic_page_id = notion.create_page(
+                        title=msg["topic_name"] or f"Topic {msg['topic_id']}",
+                        parent_page_id=channel_page_id
+                    )
+                    await db.notion_mapping.save_mapping(
+                        chat_id=msg["chat_id"],
+                        chat_name=msg["channel_name"],
+                        notion_page_id=topic_page_id,
+                        topic_id=msg["topic_id"],
+                        topic_name=msg["topic_name"]
+                    )
+                
+                parent_page_id = topic_page_id
+            
+            # Create Telegram-style message page
+            blocks = []
+            
+            # Add header with channel/topic info and message link
+            header = create_telegram_style_header(
+                message_id=msg["message_id"],
+                chat_id=msg["chat_id"],
+                channel_name=msg.get("channel_name"),
+                topic_name=msg.get("topic_name"),
+                topic_id=msg.get("topic_id"),
+                created_at=msg.get("created_at")
+            )
+            blocks.extend(notion.create_text_block(header))
+            blocks.append(notion.create_divider())
+            
+            # Check if this is an archive file with multiple extracted files
+            if msg.get("archive_files"):
+                # Handle archive files - create blocks for each extracted file
+                archive_data = msg["archive_files"]
+                blocks.extend(notion.create_archive_blocks(
+                    file_ids=archive_data["file_ids"],
+                    file_names=archive_data["file_names"],
+                    archive_name=archive_data["archive_name"]
+                ))
+            elif msg.get("media_url"):
+                # Regular single file - use appropriate block type
+                blocks.append(notion.create_media_block(
+                    file_id=msg["media_url"],
+                    mime_type=msg.get("mime_type", "file")
+                ))
+            
+            # Add caption/text as quote after media (Telegram style)
+            if msg.get("caption"):
+                blocks.extend(notion.create_quote_block(msg["caption"]))
+            
+            # Add footer with metadata
+            blocks.append(notion.create_divider())
+            footer = create_telegram_style_footer(
+                mime_type=msg.get("mime_type", "unknown"),
+                size=msg.get("size"),
+                media_title=msg.get("media_title")
+            )
+            blocks.extend(notion.create_callout_block(footer, "📊"))
+            
+            # Create smart title
+            title = create_message_title(
+                mime_type=msg.get("mime_type", "text"),
+                caption=msg.get("caption"),
+                media_title=msg.get("media_title")
+            )
+            
+            # Create the message page
+            message_page_id = notion.create_page(
+                title=title,
+                parent_page_id=parent_page_id,
+                blocks=blocks
+            )
+            
+            # Mark as indexed
+            await db.messages.mark_indexed(
+                _id=msg["_id"],
+                notion_page_id=message_page_id
+            )
+            
+            logger.info(f"Indexed message {msg['chat_id']}/{msg['message_id']}")
+            indexed += 1
+
+        except NotionConfigurationError as exc:
+            logger.warning("Notion indexing stopped: %s", exc)
+            break
+        except Exception as e:
+            logger.error(f"Failed to index message {msg['chat_id']}/{msg['message_id']}: {e}")
+            continue
+
+    if indexed:
+        logger.info("Indexed %s message(s) to Notion", indexed)

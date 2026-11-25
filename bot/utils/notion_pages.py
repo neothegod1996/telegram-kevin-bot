@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+File: notion_pages.py
+Author: Maria Kevin
+Description: Minimal Notion Pages API wrapper
+"""
+
+
+from typing import Any, Dict, List, Optional
+
+import requests
+from pydantic import BaseModel
+
+from bot.config import Config
+from bot.utils.notion_settings import normalize_notion_page_id
+
+# Notion API limits for text content in blocks
+NOTION_MAX_TEXT_LENGTH = 2000
+
+
+def split_text_chunks(text: str, max_length: int = NOTION_MAX_TEXT_LENGTH) -> List[str]:
+    """
+    Split text into chunks that respect Notion's character limit.
+    
+    Args:
+        text: Text to split
+        max_length: Maximum length per chunk (default: 2000)
+    
+    Returns:
+        List of text chunks, each <= max_length characters
+    """
+    if len(text) <= max_length:
+        return [text]
+    
+    chunks = []
+    for i in range(0, len(text), max_length):
+        chunks.append(text[i:i + max_length])
+    return chunks
+
+
+class NotionPageError(Exception):
+    """Custom exception for Notion page errors"""
+    pass
+
+
+class NotionConfigurationError(NotionPageError):
+    """Notion token or parent page is missing or invalid."""
+    pass
+
+
+class NotionBlock(BaseModel):
+    """Notion block content"""
+    type: str
+    content: Dict[str, Any]
+
+
+class NotionPageCreator:
+    """Creates Notion pages with hierarchical structure"""
+    
+    def __init__(self, token: Optional[str] = None, default_parent_id: Optional[str] = None):
+        self.token = (token or Config.NOTION_TOKEN or "").strip()
+        if not self.token:
+            raise NotionConfigurationError(
+                "NOTION_TOKEN is not set. Add it to config.env or disable Notion batch."
+            )
+        raw_parent = default_parent_id if default_parent_id is not None else Config.NOTION_PARENT_PAGE_ID
+        self.default_parent_id = normalize_notion_page_id(raw_parent)
+        self.base_url = "https://api.notion.com/v1"
+        self.headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json"
+        }
+
+    def create_page(
+        self,
+        title: str,
+        parent_page_id: Optional[str] = None,
+        blocks: Optional[List[Dict]] = None
+    ) -> str:
+        """Create a Notion page, returns page_id"""
+        initial_blocks = blocks[:100] if blocks else []
+        payload = self._create_payload(title, parent_page_id, initial_blocks)
+        
+        try:
+            response = requests.post(
+                f"{self.base_url}/pages", headers=self.headers, json=payload
+            )
+            response.raise_for_status()
+            page_id = response.json()["id"]
+            
+            if blocks and len(blocks) > 100:
+                self._append_block_chunks(page_id, blocks[100:])
+                
+            return page_id
+        except requests.RequestException as exception:
+            raise NotionPageError(self._format_error(exception)) from exception
+
+    def _create_payload(
+        self,
+        title: str,
+        parent_page_id: Optional[str],
+        initial_blocks: List[Dict]
+    ) -> Dict:
+        """Create Notion page payload"""
+        parent_id = normalize_notion_page_id(parent_page_id) or self.default_parent_id
+        if not parent_id:
+            raise NotionConfigurationError(
+                "Notion parent page is not configured. Set NOTION_PARENT_PAGE_ID or run /nchange with a page link."
+            )
+        payload = {
+            "parent": {"page_id": parent_id},
+            "properties": {"title": {"title": [{"text": {"content": title}}]}}
+        }
+        if initial_blocks:
+            payload["children"] = initial_blocks
+        return payload
+
+    def _append_block_chunks(self, block_id: str, blocks: List[Dict]) -> None:
+        """Append block children in chunks of 100 to avoid Notion API limit"""
+        for start_index in range(0, len(blocks), 100):
+            chunk = blocks[start_index:start_index + 100]
+            response = requests.patch(
+                f"{self.base_url}/blocks/{block_id}/children",
+                headers=self.headers,
+                json={"children": chunk}
+            )
+            response.raise_for_status()
+
+    def _format_error(self, exception: requests.RequestException) -> str:
+        """Format request exception with response body if available"""
+        error_msg = f"Failed to create Notion page: {str(exception)}"
+        if hasattr(exception, "response") and exception.response is not None:
+            try:
+                error_msg += f"\nResponse: {exception.response.text}"
+            except Exception:
+                pass
+        return error_msg
+
+    def create_text_block(self, text: str) -> List[Dict]:
+        """Create text paragraph block(s), automatically chunking if text exceeds limit"""
+        chunks = split_text_chunks(text)
+        blocks = []
+        for chunk in chunks:
+            blocks.append({
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {
+                    "rich_text": [{"text": {"content": chunk}}]
+                }
+            })
+        return blocks
+
+    def create_media_block(self, file_id: str, mime_type: str = "file", caption: str = "") -> Dict:
+        """Create appropriate media block based on type (image, video, or file)"""
+        # Determine block type from mime_type
+        if mime_type in ["photo", "image"] or mime_type.startswith("image"):
+            block_type = "image"
+            media_key = "image"
+        elif mime_type in ["video"] or mime_type.startswith("video"):
+            block_type = "video"
+            media_key = "video"
+        else:
+            block_type = "file"
+            media_key = "file"
+        
+        block = {
+            "object": "block",
+            "type": block_type,
+            media_key: {
+                "type": "file_upload",
+                "file_upload": {"id": file_id}
+            }
+        }
+        
+        if caption:
+            block[media_key]["caption"] = [{"text": {"content": caption}}]
+        else:
+            block[media_key]["caption"] = []
+        
+        return block
+
+    def create_file_block(self, file_id: str, caption: str = "") -> Dict:
+        """Create file block from Notion file upload (legacy, use create_media_block)"""
+        return self.create_media_block(file_id, "file", caption)
+
+    def create_callout_block(self, text: str, emoji: str = "ℹ️") -> List[Dict]:
+        """Create callout block(s) for metadata, automatically chunking if text exceeds limit"""
+        chunks = split_text_chunks(text)
+        blocks = []
+        for chunk in chunks:
+            blocks.append({
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "rich_text": [{"text": {"content": chunk}}],
+                    "icon": {"emoji": emoji}
+                }
+            })
+        return blocks
+
+    def create_divider(self) -> Dict:
+        """Create a divider block"""
+        return {"type": "divider", "divider": {}}
+
+    def create_heading(self, text: str, level: int = 3) -> List[Dict]:
+        """Create heading block(s) (level 1, 2, or 3), automatically chunking if text exceeds limit"""
+        heading_type = f"heading_{min(max(level, 1), 3)}"
+        chunks = split_text_chunks(text)
+        blocks = []
+        for chunk in chunks:
+            blocks.append({
+                "type": heading_type,
+                heading_type: {
+                    "rich_text": [{"text": {"content": chunk}}]
+                }
+            })
+        return blocks
+
+    def create_quote_block(self, text: str) -> List[Dict]:
+        """Create quote block(s) for captions, automatically chunking if text exceeds limit"""
+        chunks = split_text_chunks(text)
+        blocks = []
+        for chunk in chunks:
+            blocks.append({
+                "type": "quote",
+                "quote": {
+                    "rich_text": [{"text": {"content": chunk}}]
+                }
+            })
+        return blocks
+
+    def create_archive_blocks(
+        self,
+        file_ids: List[str],
+        file_names: List[str],
+        archive_name: str
+    ) -> List[Dict]:
+        """
+        Create blocks for files extracted from an archive.
+        
+        Args:
+            file_ids: List of Notion file IDs
+            file_names: List of original file names (relative paths in archive)
+            archive_name: Name of the original archive
+        
+        Returns:
+            List of blocks (heading + file blocks)
+        """
+        blocks = []
+        
+        # Add heading for archive
+        blocks.extend(self.create_heading(f"📦 Contents of {archive_name}", level=2))
+        blocks.append(self.create_divider())
+        
+        # Add each file as a separate block with its name
+        for file_id, file_name in zip(file_ids, file_names):
+            # Add file name as a small heading
+            blocks.extend(self.create_heading(f"📄 {file_name}", level=3))
+            
+            # Add the file block
+            blocks.append(self.create_media_block(file_id, "file", caption=file_name))
+            
+        return blocks
