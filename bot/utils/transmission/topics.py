@@ -42,7 +42,7 @@ async def resolve_destination_topic(
             if topic.name == title:
                 _mirrored_topics[key] = topic.id
                 return topic.id
-        topic = await app.create_forum_topic(chat_id=destination_id, title=title)
+        topic = await app.create_forum_topic(destination_id, title)
         _mirrored_topics[key] = topic.id
         return topic.id
 
@@ -76,7 +76,7 @@ async def create_topic_if_not_exists(
         )
         return existing_topics[topic_name]
     try:
-        topic = await client.create_forum_topic(chat_id=target_chat_id, title=topic_name)
+        topic = await client.create_forum_topic(target_chat_id, topic_name)
         logger.info("Created new topic '%s' with ID %s", topic_name, topic.id)
         existing_topics[topic_name] = topic.id
         return topic.id
