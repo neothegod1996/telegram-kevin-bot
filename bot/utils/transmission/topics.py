@@ -1,9 +1,50 @@
+import asyncio
 import logging
 from typing import Dict
 
 from pyrogram import Client, types
 
 logger = logging.getLogger(__name__)
+_mirrored_topics: dict[tuple[int, int, int], int] = {}
+_mirror_lock = asyncio.Lock()
+
+
+async def resolve_destination_topic(
+    app: Client, message: types.Message, destination_id: int
+) -> int | None:
+    """Resolve the same forum topic before either Telegram delivery method runs."""
+    source_topic = getattr(message, "topic", None)
+    source_topic_id = getattr(source_topic, "id", None)
+    source_topic_id = source_topic_id or getattr(message, "message_thread_id", None)
+    if not source_topic_id or source_topic_id == 1:
+        return None
+
+    source_chat_id = message.chat.id
+    key = (source_chat_id, source_topic_id, destination_id)
+    if key in _mirrored_topics:
+        return _mirrored_topics[key]
+
+    async with _mirror_lock:
+        if key in _mirrored_topics:
+            return _mirrored_topics[key]
+
+        title = getattr(source_topic, "name", None)
+        if not title:
+            async for topic in app.get_forum_topics(source_chat_id):
+                if topic.id == source_topic_id:
+                    title = topic.name
+                    break
+        if not title:
+            raise RuntimeError(f"Cannot resolve source topic {source_chat_id}:{source_topic_id}")
+
+        # Fail instead of sending to General if listing or creating the topic fails.
+        async for topic in app.get_forum_topics(destination_id):
+            if topic.name == title:
+                _mirrored_topics[key] = topic.id
+                return topic.id
+        topic = await app.create_forum_topic(chat_id=destination_id, title=title)
+        _mirrored_topics[key] = topic.id
+        return topic.id
 
 
 async def get_topics_by_chat_id(client: Client, chat_id: int) -> Dict[str, int]:

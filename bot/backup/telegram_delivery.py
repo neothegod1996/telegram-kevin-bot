@@ -26,13 +26,15 @@ class ChannelRoute:
     destination_channel_id: int
     topic_id: Optional[int] = None
     paid_media: Optional[dict[str, Any]] = None
+    mirror_topics: bool = False
 
     @classmethod
-    def from_user_channel(cls, channel: dict) -> "ChannelRoute":
+    def from_user_channel(cls, channel: dict, *, mirror_topics: bool = False) -> "ChannelRoute":
         return cls(
             destination_channel_id=int(channel["destination_channel_id"]),
             topic_id=channel.get("topic_id"),
             paid_media=channel.get("paid_media"),
+            mirror_topics=mirror_topics,
         )
 
 
@@ -81,11 +83,13 @@ async def get_delivery_destinations(
     for channel in user_channels:
         dest_channel_id = channel["destination_channel_id"]
         reachable = False
+        is_forum = False
         for client in (app, bot):
             if client is None:
                 continue
             try:
-                await client.get_chat(dest_channel_id)
+                chat = await client.get_chat(dest_channel_id)
+                is_forum = getattr(chat, "is_forum", False) is True
                 reachable = True
                 break
             except Exception as exc:
@@ -100,7 +104,11 @@ async def get_delivery_destinations(
                 "Using destination %s from channel pair; clients could not get_chat (delivery may still work).",
                 dest_channel_id,
             )
-        valid.append(ChannelRoute.from_user_channel(channel))
+        valid.append(
+            ChannelRoute.from_user_channel(
+                channel, mirror_topics=is_forum and not channel.get("topic_id")
+            )
+        )
 
     if not valid:
         valid.append(ChannelRoute(destination_channel_id=user_id))
@@ -127,24 +135,15 @@ class TelegramDeliveryEngine:
         route: ChannelRoute,
         kwargs: dict[str, Any],
     ) -> Optional[types.Message]:
-        from bot.utils.transmission.topics import handle_topic_thread
-
         dest_id = route.destination_channel_id
-        copy_kwargs = dict(kwargs)
-        if route.topic_id:
-            copy_kwargs["message_thread_id"] = route.topic_id
-        else:
-            await handle_topic_thread(app, message, dest_id, copy_kwargs)
-
         try:
-            thread_id = copy_kwargs.get("message_thread_id")
             return await app.copy_message(
                 chat_id=dest_id,
                 from_chat_id=message.chat.id,
                 message_id=message.id,
                 caption=message.caption or message.text,
                 reply_markup=message.reply_markup,
-                message_thread_id=thread_id,
+                message_thread_id=kwargs.get("message_thread_id"),
             )
         except Exception as exc:
             if _copy_failure(exc):
@@ -176,6 +175,10 @@ class TelegramDeliveryEngine:
 
         kwargs: dict[str, Any] = {}
         topic_id = route.topic_id
+        if route.mirror_topics and topic_id is None:
+            from bot.utils.transmission.topics import resolve_destination_topic
+
+            topic_id = await resolve_destination_topic(app, message, dest_id)
         paid_star = (
             route.paid_media.get("stars")
             if route.paid_media and route.paid_media.get("status")
